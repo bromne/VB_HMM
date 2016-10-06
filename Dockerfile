@@ -14,4 +14,4 @@ COPY . /app/
 
 RUN chmod -R 644 /app/tests
 
-CMD ["nosetests", "--with-coverage", "--cover-package=vbhmm"]
+CMD ["/app/inspect.sh"]
