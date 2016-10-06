@@ -1,0 +1,4 @@
+vbhmm:
+  build: .
+  volumes:
+    - .:/app
