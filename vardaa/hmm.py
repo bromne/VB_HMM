@@ -3,32 +3,30 @@ from numpy.random import rand, dirichlet, normal, random, randn
 from scipy.cluster import vq
 from scipy.special import gammaln, digamma
 from scipy.linalg import eig, inv, cholesky
-from vbhmm.util import *
+from vardaa.util import logsum, log_like_gauss, kl_dirichlet, kl_gauss_wishart, normalize, sample_gaussian
 
-"""
+
+class VbHmm():
+    """
     VB-HMM with Gaussian emission probability.
     VB-E step is Forward-Backward Algorithm.
-"""
+    """
 
-
-class VB_HMM():
-
-    def __init__(self, n, uPi0=0.5, uA0=0.5, m0=0.0,
-                 beta0=1, nu0=1, s0=0.01):
+    def __init__(self, n, uPi0=0.5, uA0=0.5, m0=0.0, beta0=1, nu0=1, s0=0.01):
 
         self.n_states = n
         # log initial probability
-        self._lnPi = np.log(np.tile(1.0 / n, n))
+        self._lnpi = np.log(np.tile(1.0 / n, n))
         # log transition probability
         self._lnA = np.log(dirichlet([1.0] * n, n))
 
         # 事前分布のハイパーパラメータ
-        self._uPi = np.ones(n) * uPi0   # 初期状態確率
-        self._uA = np.ones((n, n)) * uA0     # 遷移確率
+        self._upi = np.ones(n) * uPi0   # 初期状態確率
+        self._ua = np.ones((n, n)) * uA0     # 遷移確率
 
         # 事後分布のパラメータ
-        self._wPi = np.array(self._uPi)  # 初期確率
-        self._wA = np.array(self._uA)  # 遷移確率
+        self._wpi = np.array(self._upi)  # 初期確率
+        self._wa = np.array(self._ua)  # 遷移確率
 
         self._m0 = m0
         self._beta0 = beta0
@@ -55,7 +53,7 @@ class VB_HMM():
         """
         T = len(lnF)
         lnAlpha *= 0.0
-        lnAlpha[0, :] = self._lnPi + lnF[0, :]
+        lnAlpha[0, :] = self._lnpi + lnF[0, :]
 
         for t in range(1, T):
             lnAlpha[t, :] = logsum(lnAlpha[t - 1, :] +
@@ -80,20 +78,20 @@ class VB_HMM():
             lnBeta[t, :] = logsum(
                 self._lnA + lnF[t + 1, :] + lnBeta[t + 1, :], 1)
 
-        return lnBeta, logsum(lnBeta[0, :] + lnF[0, :] + self._lnPi)
+        return lnBeta, logsum(lnBeta[0, :] + lnF[0, :] + self._lnpi)
 
     def _initialize_vbhmm(self, obs, scale=10.0):
         n_states = self.n_states
 
         T, D = obs.shape
-        self.mu, temp = vq.kmeans2(obs, n_states)
+        self.mu, _ = vq.kmeans2(obs, n_states)
         self.cv = np.tile(np.identity(D), (n_states, 1, 1))
 
         if self._nu0 < D:
             self._nu0 += D
 
         self._m0 = np.mean(obs, 0)
-        self._V0 = np.atleast_2d(np.cov(obs.T)) * scale
+        self._v0 = np.atleast_2d(np.cov(obs.T)) * scale
 
         self.A = dirichlet([1.0] * n_states, n_states)   # A:状態遷移行列
         self.pi = np.tile(1.0 / n_states, n_states)  # pi:初期状態確率
@@ -101,91 +99,74 @@ class VB_HMM():
         # posterior for hidden states
         self.z = dirichlet(np.tile(1.0 / n_states, n_states), T)
         # for mean vector
-        self._m, temp = vq.kmeans2(obs, n_states, minit='points')
+        self._m, _ = vq.kmeans2(obs, n_states, minit='points')
         self._beta = np.tile(self._beta0, n_states)
         # for covarience matrix
-        self._V = np.tile(np.array(self._V0), (n_states, 1, 1))
+        self._v = np.tile(np.array(self._v0), (n_states, 1, 1))
         self._nu = np.tile(float(T) / n_states, n_states)
 
         # aux valable
-        self._C = np.array(self._V)
+        self._c = np.array(self._v)
 
     def _log_like_f(self, obs):
-        return log_like_Gauss(obs, self._nu, self._V, self._beta, self._m)
+        return log_like_gauss(obs, self._nu, self._v, self._beta, self._m)
 
     def _calculate_sufficient_statistics(self, obs, lnXi, lnGamma):
         # z[n,k] = Q(zn=k)
         nmix = self.n_states
-        T, D = obs.shape
+        t, d = obs.shape
         self.z = np.exp(np.vstack(lnGamma))
         self.z0 = np.exp([lg[0] for lg in lnGamma]).sum(0)
-        self._N = self.z.sum(0)
-        self._Xbar = np.dot(self.z.T, obs) / self._N[:, np.newaxis]
+        self._n = self.z.sum(0)
+        self._xbar = np.dot(self.z.T, obs) / self._n[:, np.newaxis]
         for k in range(nmix):
-            d_obs = obs - self._Xbar[k]
-            self._C[k] = np.dot((self.z[:, k] * d_obs.T), d_obs)
+            d_obs = obs - self._xbar[k]
+            self._c[k] = np.dot((self.z[:, k] * d_obs.T), d_obs)
 
     def _update_parameters(self, obs, lnXi, lnGamma):
         nmix = self.n_states
-        T, D = obs.shape
+        t, d = obs.shape
         # update parameters of initial prob
-        self._wPi = self._uPi + self.z0
-        self._lnPi = digamma(self._wPi) - digamma(self._wPi.sum())
+        self._wpi = self._upi + self.z0
+        self._lnpi = digamma(self._wpi) - digamma(self._wpi.sum())
 
         # update parameters of transition prob
-        self._wA = self._uA + np.exp(lnXi).sum()
-        self._lnA = digamma(self._wA) - digamma(self._wA)
+        self._wa = self._ua + np.exp(lnXi).sum()
+        self._lnA = digamma(self._wa) - digamma(self._wa)
 
         for k in range(nmix):
             self._lnA[k, :] = digamma(
-                self._wA[k, :]) - digamma(self._wA[k, :].sum())
+                self._wa[k, :]) - digamma(self._wa[k, :].sum())
 
-        self._beta = self._beta0 + self._N
-        self._nu = self._nu0 + self._N
-        self._V = self._V0 + self._C
+        self._beta = self._beta0 + self._n
+        self._nu = self._nu0 + self._n
+        self._v = self._v0 + self._c
 
         for k in range(nmix):
             self._m[k] = (self._beta0 * self._m0 +
-                          self._N[k] * self._Xbar[k]) / self._beta[k]
-            dx = self._Xbar[k] - self._m0
-            self._V[k] += (self._beta0 * self._N[k] /
-                           self._beta[k] + self._N[k]) * np.outer(dx, dx)
+                          self._n[k] * self._xbar[k]) / self._beta[k]
+            dx = self._xbar[k] - self._m0
+            self._v[k] += (self._beta0 * self._n[k] /
+                           self._beta[k] + self._n[k]) * np.outer(dx, dx)
 
-    def _KL_div(self):
+    def _kl_div(self):
         """
         Compute KL divergence of initial and transition probabilities
         """
         n_states = self.n_states
-        KLPi = KL_Dirichlet(self._wPi, self._uPi)
-        KLA = 0
-        KLg = 0
-        KL = 0
+        kl_pi = kl_dirichlet(self._wpi, self._upi)
+        kl_A = 0
+        kl_g = 0
+        kl = 0
         for k in range(n_states):
-            KLA += KL_Dirichlet(self._wA[k], self._uA[k])
-            KLg += KL_GaussWishart(self._nu[k], self._V[k], self._beta[k],
-                                   self._m[k], self._nu0, self._V0,
-                                   self._beta0, self._m0)
-        KL += KLPi + KLA + KLg
-        return KL
+            kl_A += kl_dirichlet(self._wa[k], self._ua[k])
+            kl_g += kl_gauss_wishart(self._nu[k], self._v[k], self._beta[k],
+                                     self._m[k], self._nu0, self._v0,
+                                     self._beta0, self._m0)
+        kl += kl_pi + kl_A + kl_g
+        return kl
 
-    def _get_expectations(self):
-        """
-        Calculate expectations of parameters over posterior distribution
-        """
-        self.A = self._wA / self._wA.sum(1)[:, np.newaxis]
-        # <pi_k>_Q(pi_k)
-        self.ev = eig(self.A.T)
-        self.pi = normalize(np.abs(self.ev[1][:, self.ev[0].argmax()]))
-
-        # <mu_k>_Q(mu_k,W_k)
-        self.mu = np.array(self._m)
-
-        # inv(<W_k>_Q(W_k))
-        self.cv = self._V / self._nu[:, np.newaxis, np.newaxis]
-
-        return self.pi, self.A, self.mu, self.cv
-
-    def _Estep(self, lnF, lnAlpha, lnBeta, lnXi):
+    def _e_step(self, lnF, lnAlpha, lnBeta, lnXi):
         """
         lnF [ndarray, shape (n,n_states)] : loglikelihood of emissions
         lnAlpha [ndarray, shape (n, n_states]: log forward message
@@ -195,12 +176,12 @@ class VB_HMM():
         """
         T = len(lnF)
         # forward-backward algorithm
-        lnAlpha, lnPx_f = self._forward(lnF, lnAlpha)
-        lnBeta, lnPx_b = self._backward(lnF, lnBeta)
+        lnAlpha, lnpx_f = self._forward(lnF, lnAlpha)
+        lnBeta, lnpx_b = self._backward(lnF, lnBeta)
 
         # check if forward and backward were done correctly
-        dlnP = lnPx_f - lnPx_b
-        if abs(dlnP) > 1.0e-6:
+        dlnp = lnpx_f - lnpx_b
+        if abs(dlnp) > 1.0e-6:
             print("warning forward and backward are not equivalent")
 
         # compute lnXi for updating transition matrix
@@ -209,14 +190,14 @@ class VB_HMM():
                 for t in range(T - 1):
                     lnXi[t, i, j] = lnAlpha[t, i] + self._lnA[i, j, ] + \
                         lnF[t + 1, j] + lnBeta[t + 1, j]
-        lnXi -= lnPx_f
+        lnXi -= lnpx_f
 
         # compute lnGamma for postetior on hidden states
-        lnGamma = lnAlpha + lnBeta - lnPx_f
+        lnGamma = lnAlpha + lnBeta - lnpx_f
 
-        return lnXi, lnGamma, lnPx_f
+        return lnXi, lnGamma, lnpx_f
 
-    def _Mstep(self, obs, lnXi, lnGamma):
+    def _m_step(self, obs, lnXi, lnGamma):
         self._calculate_sufficient_statistics(obs, lnXi, lnGamma)
         self._update_parameters(obs, lnXi, lnGamma)
 
@@ -228,101 +209,51 @@ class VB_HMM():
 
         lnF = self._log_like_f(obs)
         lnAlpha, lnBeta, lnXi = self._allocate_fb(obs)
-        lnXi, lnGamma, lnP = self._Estep(lnF, lnAlpha, lnBeta, lnXi)
+        lnXi, lnGamma, lnp = self._e_step(lnF, lnAlpha, lnBeta, lnXi)
         z = np.exp(lnGamma)
-        return z, lnP
-
-    def score(self, obs):
-        """
-        score the model
-            input
-              obs [ndarray, shape(nobs,ndim)] : observed data
-            output
-              F [float] : variational free energy of the model
-        """
-        n_obs = obs.shape
-        z, lnP = self._eval_hidden_states(obs)
-        F = -lnP + self._KL_div()
-        return F
+        return z, lnp
 
     def fit(self, obs, n_iter=10000, eps=1.0e-4,
-            ifreq=10, old_F=1.0e20, init=True):
+            ifreq=10, old_f=1.0e20, init=True):
         '''Fit the HMM via VB-EM algorithm'''
         if init:
             self._initialize_vbhmm(obs)
-            old_F = 1.0e20
+            old_f = 1.0e20
             lnAlpha, lnBeta, lnXi = self._allocate_fb(obs)
 
         for i in range(n_iter):
             # VB-E step
             lnF = self._log_like_f(obs)
-            lnXi, lnGamma, lnP = self._Estep(lnF, lnAlpha, lnBeta, lnXi)
+            lnXi, lnGamma, lnp = self._e_step(lnF, lnAlpha, lnBeta, lnXi)
 
             # check convergence
-            KL = self._KL_div()
-            F = -lnP + KL
-            dF = F - old_F
-            if(abs(dF) < eps):
+            kl = self._kl_div()
+            f = -lnp + kl
+            df = f - old_f
+            if(abs(df) < eps):
                 print("%8dth iter, Free Energy = %12.6e, dF = %12.6e" %
-                      (i, F, dF))
-                print("%12.6e < %12.6e Converged" % (dF, eps))
+                      (i, f, df))
+                print("%12.6e < %12.6e Converged" % (df, eps))
                 break
-            if i % ifreq == 0 and dF < 0.0:
-                print("% 6dth iter, F = % 15.8e  df = % 15.8e" % (i, F, dF))
-            elif dF >= 0.0:
+            if i % ifreq == 0 and df < 0.0:
+                print("% 6dth iter, F = % 15.8e  df = % 15.8e" % (i, f, df))
+            elif df >= 0.0:
                 print("% 6dth iter, F = % 15.8e  df = % 15.8e warning" %
-                      (i, F, dF))
+                      (i, f, df))
 
-            old_F = F
-            print(old_F)
+            old_f = f
+            print(old_f)
 
             # update parameters via VB-M step
-            self._Mstep(obs, lnXi, lnGamma)
-
-    def show_model(self, show_pi=True, show_A=True, show_mu=False,
-                   show_cv=False, eps=1.0e-2):
-        """
-        return parameters of relavent clusters
-        """
-        self._get_expectations()
-        ids = []
-        sorted_ids = (-self.pi).argsort()
-        for k in sorted_ids:
-            if self.pi[k] > eps:
-                ids.append(k)
-        pi = self.pi[ids]
-        mu = self.mu[ids]
-        cv = self.cv[ids]
-        A = np.array([AA[ids] for AA in self.A[ids]])
-        for k in range(len(ids)):
-            i = ids[k]
-            print("\n%dth component, pi = %8.3g" % (k, pi[i]))
-            print("cluster id =", i)
-        if show_pi:
-            print("pi = ", pi)
-        if show_A:
-            print("A = ", A)
-        if show_mu:
-            print("mu =", mu[i])
-        if show_cv:
-            print("cv =", cv[i])
-
-        return ids, pi, A, mu, cv
-
-    def decode(self, obs):
-        """
-        Get the most probable cluster id
-        """
-        z, lnP = self._eval_hidden_states(obs)
-        return z.argmax(1)
+            self._m_step(obs, lnXi, lnGamma)
 
     def simulate(self, T, mu, cv):
-        N, D = mu.shape
+        n, d = mu.shape
 
-        pi_cdf = np.exp(self._lnPi).cumsum()
+        pi_cdf = np.exp(self._lnpi).cumsum()
         A_cdf = np.exp(self._lnA).cumsum(1)
         z = np.zeros(T, dtype=np.int)
-        o = np.zeros((T, D))
+        o = np.zeros((T, d))
         r = random(T)
         z[0] = (pi_cdf > r[0]).argmax()
         o[0] = sample_gaussian(mu[z[0]], cv[z[0]])
